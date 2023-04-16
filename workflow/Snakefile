@@ -1,0 +1,147 @@
+import pandas as pd
+import seaborn as sns
+from scipy.stats import linregress
+import numpy as np
+
+(samples,) = glob_wildcards("samples/{sample}.faa")
+
+
+localrules:
+    seqlength,
+    ampgram,
+    ampep,
+    processampep,
+    merge,
+
+
+rule all:
+    input:
+        expand("results/{sample}.csv", sample=samples),
+
+
+rule seqlength:
+    input:
+        "samples/{sample}.faa",
+    output:
+        temp("results/{sample}_length.csv"),
+    conda:
+        "envs/seqlength.yaml"
+    script:
+        "scripts/seqlength.py"
+
+
+rule ampgram:
+    input:
+        "samples/{sample}.faa",
+    output:
+        temp("results/{sample}_ampgram.csv"),
+    threads: 3
+    script:
+        "scripts/ampgram.R"
+
+
+rule ampep:
+    input:
+        "samples/{sample}.faa",
+    conda:
+        "amPEP"
+    output:
+        temp("results/{sample}_amppeppre.tsv"),
+    shell:
+        "ampep predict -m workflow/scripts/amPEP.model -i {input} -o {output}"
+
+
+rule processampep:
+    input:
+        "results/{sample}_amppeppre.tsv",
+    output:
+        temp("results/{sample}_ampep.csv"),
+    run:
+        df = pd.read_csv(input[0], sep="\t")
+        df = df[["probability_AMP"]]
+        df.columns = ["ampep"]
+        df.to_csv(output[0], index=False)
+
+
+rule ampscan:
+    input:
+        "samples/{sample}.faa",
+    output:
+        temp("results/{sample}_amp.csv"),
+    conda:
+        "envs/amp.yaml"
+    shell:
+        "python3.6 workflow/scripts/amp_scanner_predict.py {input} workflow/scripts/020419_FULL_MODEL.h5"
+
+
+rule processampscan:
+    input:
+        "results/{sample}_amp.csv",
+    output:
+        temp("results/{sample}_ampscan.csv"),
+    run:
+        df = pd.read_csv(input[0])
+        df = df[["Prediction_Probability"]]
+        df.columns = ["ampscan"]
+        df.to_csv(output[0], index=False)
+
+
+rule merge:
+    input:
+        ampgram="results/{sample}_ampgram.csv",
+        length="results/{sample}_length.csv",
+        ampep="results/{sample}_ampep.csv",
+        ampscan="results/{sample}_ampscan.csv",
+    output:
+        out="results/{sample}.csv",
+        fig="results/{sample}.png",
+    params:
+        weights=[0.75, 0.57, 1],  # specify weights or leave empty to calculate
+    run:
+        s = []
+
+
+        def read_fasta(csv):
+            s.append(pd.read_csv(str(csv), index_col=False))
+
+
+        for att, value in input.items():
+            read_fasta(value)
+
+        df = pd.concat(s, axis=1).set_index("name")
+
+        # Find correlation to length
+        predictors = ["ampgram", "ampep", "ampscan"]
+
+        if len(params.weights) == 0:
+            weights = []
+            for predictor in predictors:
+                slope, intercept, r, p, se = linregress(
+                    df.loc[:, predictor], df.loc[:, "length"]
+                )
+                if p < 0.05:
+                    print(
+                        "{} is correlated to length with an R^2 of {:.2f}".format(
+                            predictor, r
+                        )
+                    )
+                    weights.append(1 - np.abs(r))
+                else:
+                    weights.append(1)
+                    # Print pairplot
+        else:
+            weights = params.weights
+
+        pp = sns.pairplot(df)
+        pp.savefig(output.fig)
+        # Calculate simple mean
+        df["mean"] = df.loc[:, predictors].mean(axis=1)
+        # Calculate weighted mean
+        df["weighted_mean"] = (
+            df.loc[:, predictors[0]] * weights[0]
+            + df.loc[:, predictors[1]] * weights[1]
+            + df.loc[:, predictors[2]] * weights[2]
+        ) / 3
+
+        # Print final dataframe
+        df.to_csv(output.out)
